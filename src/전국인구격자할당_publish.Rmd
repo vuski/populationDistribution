@@ -252,7 +252,43 @@ rm(sggBndry)
 
 
 
+```{r}
+extractSggGrid <- function(popuGridData, sggCode, sggcoordData) {
+  
+  sggcoordExtracted <- sggcoordData %>% filter(sggcode==sggCode)
+  
+  popuGridFiltered <- filteringSggGrid(popuGridData$x, popuGridData$y,
+                                       popuGridData$value, sggcoordExtracted$X,
+                                       sggcoordExtracted$Y,sggcoordExtracted$L1,
+                                       sggcoordExtracted$L2,sggcoordExtracted$L3)   
+  return (popuGridFiltered)
+}
+```
 
+
+
+
+```{r, fig.width = 12, fig.height = 12}
+
+
+popuPart <- extractSggGrid(popuGrid250, "32030", sggcoord)
+
+ggplot(data = popuPart %>% filter(value>1), aes(x=x, y=y, color = value)) +
+  geom_point() +
+  theme_bw() +
+  #scale_size(range = c(1,8), breaks = c(0,1000,2000,3000, 4000, 5000, 6000, 7000))+
+  #scale_colour_gradient2()+
+  scale_color_continuous(low = "#ffcc11", high = "red", breaks = c(1000,4000,7000) ) +
+  coord_fixed(ratio = 1)
+
+ggsave(paste0(folderWrite,"강릉_2000.png"),
+       antialias = "default", width = 240, height = 240, unit = c("mm"), dpi = 300)
+
+
+popuShp <- st_as_sf(popuGrid250, coords = c("x", "y"), crs = 5179)
+st_write(popuShp, paste0(folderWrite,"popu250.shp"), driver="ESRI Shapefile")
+
+```
 
 
 
