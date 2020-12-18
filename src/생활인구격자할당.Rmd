@@ -1,0 +1,300 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+
+```{r}
+
+library(foreach)
+library(doParallel)
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(scales)
+######### 병렬 처리 ##########
+# 코어 개수 획득
+numCores <- parallel::detectCores() - 1
+
+```
+
+
+
+
+```{r}
+
+
+library(Rcpp)
+library(sf)
+
+folderWrite <- "d:/지난번에 만든 250m 그리드 파일/" #마지막에 슬래시를 넣는다.
+
+#Rcpp 파일 로드(별도로 설명한다)
+sourceCpp("distributeValueToGrid.cpp")
+
+#건물이 존재하는 250m 그리드를 읽는다. 기존에 저장한 파일
+bldgGrid <- fread(paste0(folderWrite,"bldgGrid_parallel.tsv"),
+                            sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+#Rcpp 변수에 입력한다. 추후 인구를 할당할 때 사용할 준비작업
+bldgGridToSet(as.integer(bldgGrid$gridx), as.integer(bldgGrid$gridy))
+rm(bldgGrid)
+
+
+```
+
+
+
+```{r}
+
+##집계구 경계를 읽는다.
+
+folderAdm <- "d:/서울시 생활인구/내국인/통계지역경계(2016년+기준)/"
+fileName <- paste0(folderAdm,"집계구.shp")
+system.time( admBndry <- fileName %>% read_sf())
+
+
+#앞에서 읽은 집계구별 총 인구에 집계구를 join한다.
+#집계구 도형 순서와 일치하는 집계구~인구 데이터프레임을 만드는 작업이다.
+admCD <- as.data.frame(admBndry$TOT_REG_CD)
+colnames(admCD) <- c("TOT_REG_CD")
+
+
+#집계구 경계를 입력한다. 한번만 입력하면 된다.
+admcoord <- admBndry %>% st_coordinates()
+
+#서울시 생활인구에서 제공하는 집계구는 MultiPolygon이 아닌 Ploygon 형식이므로 기존 함수에 보내는 변수가 약간 다르다.
+##4번째 변수와 5번째 변수를 같게 한다. 기존 코드를 재사용하기 위함
+putAdmBoundary(admcoord[,1], admcoord[,2],
+                  as.integer(admcoord[,3]), as.integer(admcoord[,4]), 
+                  as.integer(admcoord[,4]))
+rm(admcoord)
+rm(admBndry)
+
+```
+
+
+
+
+```{r}
+#재분배 함수
+
+library(lubridate)
+
+#50m 그리드를 상위 그리드로 재집계 하는 함수
+aggregatePopuGrid <- function(gridPopu, fromGrid, toGrid) {
+  
+  if (fromGrid >= toGrid) {
+    print("그리드 설정 오류")
+    return(NULL)
+  }
+  
+  temp <- gridPopu %>% mutate(x = as.integer(as.integer(x/toGrid)*toGrid) + (toGrid/2) ,
+                            y = as.integer(as.integer(y/toGrid)*toGrid) + (toGrid/2)) %>%
+    group_by(x,y) %>%
+    summarise(.groups="keep", value = sum(value)) %>%
+    ungroup()
+  
+  return(temp)
+  
+}
+
+distributePopulation <- function(fileName, admCD_) {
+  
+  
+  
+      
+  # 통계청 집계구별 인구를 읽는다.
+  system.time(popu <- fread(fileName,
+                              sep = ",", header = TRUE, stringsAsFactors = FALSE,
+                              quote="\"", encoding="unknown",
+                              select = c(1,2,4,5), col.names = c("yyyymmdd","hh","admcd","popu"),
+                              colClasses = list(character=1:4, numeric=5)))
+  
+  
+  
+  hours <- c("00","01","02","03","04","05",
+             "06","07","08","09","10","11",
+             "12","13","14","15","16","17",
+             "18","19","20","21","22","23") 
+  ymdchr <- popu[1]$yyyymmdd
+  
+  numCores <- parallel::detectCores()-1
+  
+  if (exists("result_")) rm(result_)
+  
+  for (hour in hours) {
+  
+    #Rcpp 변수에 입력한다. 집계구 polygon의 일련번호와 일치하는 인구다.
+    #뒤에서 그리드에 할당할 때 사용한다.
+    #시간별로 데이터가 주어지므로, 한번에 하나의 시간대 데이터를 필터링해서 격자배분
+    admJoined <- admCD_ %>% left_join(., popu %>% filter(hh==hour),
+                           by=c("TOT_REG_CD"="admcd"))
+    putAdmPopu(admJoined$popu)
+    
+    #격자 배분
+    resultHourly <- distributeValue(numCores) 
+    
+    #곧바로 500m 격자로 재취합한다.
+    system.time(resultHourly <- aggregatePopuGrid(resultHourly, 50, 500) %>% mutate(hh = hour))
+    
+    print(paste0(hour,"시 생활인구 :",sum(resultHourly$value, na.rm = T)))
+    
+    #누적
+    if (exists("result_"))  { 
+      result_ <- result_ %>% rbind(resultHourly) 
+    }  else {
+      result_ <- resultHourly
+    }
+    
+  }
+  
+  #시각변수 추가
+  result_ <- result_ %>% mutate(date = ymd_hms(paste0(ymdchr," ",hh,"0000"))) %>%
+    mutate(popu = replace_na(value, 0)) %>% 
+    select(date,x,y,popu)
+  print(paste0("평균 인구 집계(파일 총계) :",sum(result_$popu)/24))
+  
+  rm(resultHourly)
+  rm(admJoined)
+  rm(popu)
+  return(result_)
+}
+
+
+
+
+
+```
+
+
+```{r, fig.width = 13, fig.height = 12}
+
+
+folderPopu <- "d:/서울시 생활인구/내국인/LOCAL_PEOPLE_202002/"
+src_files <- list.files(folderPopu)
+
+if (exists("resultFinal")) rm(resultFinal)
+
+#날짜별로 읽어서 보낸다.
+for (file in src_files) {
+  
+  fileName <- paste0(folderPopu, file)
+  resultDaily <- distributePopulation(fileName, admCD)
+  
+  if (exists("resultFinal"))  { 
+     resultFinal <- resultFinal %>% rbind(resultDaily) 
+  }  else {
+     resultFinal <- resultDaily
+  }
+    
+  print(fileName)
+}
+
+rm(resultDaily)
+
+```
+
+
+```{r, fig.width = 13, fig.height = 12}
+
+
+folderPopu <- "d:/서울시 생활인구/내국인/LOCAL_PEOPLE_202003/"
+src_files2 <- list.files(folderPopu)
+
+#날짜별로 읽어서 보낸다.
+for (file in src_files2) {
+  
+  fileName <- paste0(folderPopu, file)
+  resultDaily <- distributePopulation(fileName, admCD)
+  
+  if (exists("resultFinal"))  { 
+     resultFinal <- resultFinal %>% rbind(resultDaily) 
+  }  else {
+     resultFinal <- resultDaily
+  }
+    
+  print(fileName)
+}
+
+rm(resultDaily)
+
+```
+
+
+```{r}
+folderWork <- "d:/work/"
+
+
+fwrite(resultFinal %>% mutate(popu = round(popu, digits=2)), file=paste0(folderWork,"resultDistributed_500m_Feb_Mar.tsv"),
+         quote=FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+
+##gis 용으로는 dcast로 변환해서 저장한다.
+resultFinalStr <- resultFinal %>% filter(date <= ymd(20200210)) %>%
+  mutate(date = as.character(date)) %>%
+  mutate(date = paste0("D",substr(date,3,4), substr(date,6,7), substr(date,9,10), substr(date,12,13)))
+
+resultFinalCasted <- resultFinalStr %>%
+    reshape2::dcast(x+y~date, value.var = "popu")
+
+popuShp <- st_as_sf(resultFinalCasted, coords = c("x", "y"), crs = 5179) 
+st_write(popuShp, paste0(folderWork,"popu500_20200210.shp"), driver="ESRI Shapefile")
+```
+
+
+
+```{r, fig.width = 14, fig.height = 12}
+
+
+#하루 평균치를 구해서 그려보자.
+resultDaily <- resultFinal %>% mutate(date = date(date)) %>%
+  group_by(date, x,y) %>%
+  summarise(.groups="keep",popu = sum(popu)/24) %>%
+  ungroup()
+
+
+## 그래프 그리기
+ggplot(data = resultDaily %>% filter(x>=953000 & x<=957000 & y>=1949000 & y<=1953000),
+            aes(x=date, y=popu),
+            alpha=0.7, size = 0.7)+
+  geom_line()+ 
+  geom_area()+
+  
+  facet_grid( -y~x)+
+  coord_cartesian(ylim = c(0,14000))+
+  theme_classic() +
+  theme(axis.title.y.right = element_blank(),                # hide right axis title
+        axis.text.y.right = element_blank(),                 # hide right axis labels
+        axis.ticks.y = element_blank(),                      # hide left/right axis ticks
+        axis.text.y = element_text(margin = margin(r = 0)),  # move left axis labels closer to axis
+        panel.spacing = unit(0, "mm"),                       # remove spacing between facets
+        strip.background = element_rect(size = 0.5))  +      # match default line size of theme_classic
+  labs(x="time", y="popu")
+
+ggsave(paste0(folderWork,"서울전체 생활인구 격자_일부.png"),
+       antialias = "default", width = 400, height = 400, unit = c("mm"), dpi = 300)
+
+ploted <- ggplot(data = resultDaily, aes(x=date, y=popu),
+                 alpha=0.7, size = 0.7)+
+  geom_line()+ 
+  geom_area()+
+  facet_grid( -y~x)+
+  coord_cartesian(ylim = c(0,14000))+
+  theme_classic() +
+  theme(axis.title.y.right = element_blank(),                # hide right axis title
+        axis.text.y.right = element_blank(),                 # hide right axis labels
+        axis.ticks.y = element_blank(),                      # hide left/right axis ticks
+        axis.text.y = element_text(margin = margin(r = 0)),  # move left axis labels closer to axis
+        panel.spacing = unit(0, "mm"),                       # remove spacing between facets
+        strip.background = element_rect(size = 0.5))  +      # match default line size of theme_classic
+  labs(x="time", y="popu")
+
+
+ggsave(plot = ploted, paste0(folderWork,"서울전체 생활인구 격자.png"),
+       antialias = "default", width = 440, height = 400, unit = c("mm"), dpi = 300)
+
+```
+
